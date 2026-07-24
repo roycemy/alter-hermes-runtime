@@ -1,0 +1,6 @@
+deploy.private.yaml
+*.private.yaml
+.env
+secrets/
+credentials/
+whatsapp-session/
