@@ -1,182 +1,226 @@
+"""Hermes: a quiet background reader for Royce Myers.
+
+Nightly, Hermes reads four small memory files (me.md, projects.md,
+decisions.md, proposals.md) plus task summaries Instinct drops in inbox/,
+makes one cheap-model pass, and emails a stall report to Instinct. It does
+not build, code, or message anyone else. Instinct relays the report to
+Royce; nothing comes back to Hermes.
+"""
 from __future__ import annotations
-import asyncio, email, imaplib, json, logging, os, shlex, smtplib, sqlite3, ssl, subprocess, time, uuid
+import argparse, logging, os, re, smtplib, sqlite3, ssl, sys, time
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Any
+from zoneinfo import ZoneInfo
 import yaml
-from openai import AsyncOpenAI
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from safety import inspect
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("hermes")
+
 DATA = Path(os.getenv("HERMES_DATA_DIR", "/data")); DATA.mkdir(parents=True, exist_ok=True)
-WORKSPACE = Path(os.getenv("HERMES_WORKSPACE", "/workspace")).resolve(); WORKSPACE.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA / "hermes.db"
+APP = Path(os.getenv("HERMES_APP_DIR", "/app"))
 INSTINCT = os.getenv("HERMES_INSTINCT_ADDRESS", "xt1udv@mail.instinct.com")
-OWNER_ID = int(os.getenv("TELEGRAM_ALLOWED_USER_ID", "0") or 0)
-MODE = os.getenv("HERMES_MODE", "readonly").lower()
-FALLBACK_SECONDS = int(os.getenv("HERMES_FALLBACK_MINUTES", "30")) * 60
-FORBIDDEN_INTEGRATION_MARKERS = ("GMAIL", "GOOGLE_CALENDAR", "CONTACTS", "CANVAS", "VHL", "SCHOOL_ACCOUNT", "SLACK", "NOTION", "WHATSAPP")
+MODEL = os.getenv("HERMES_MODEL", "gpt-4o-mini")
+MAX_TOKENS = int(os.getenv("HERMES_MAX_TOKENS_PER_RUN", "1500"))
+MONTHLY_BUDGET_USD = float(os.getenv("HERMES_MONTHLY_BUDGET_USD", "1.00"))
+
+# USD per 1M tokens (input, output). Override with HERMES_PRICE_INPUT_PER_1M / HERMES_PRICE_OUTPUT_PER_1M.
+PRICES = {
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-5-mini": (0.25, 2.00),
+}
+FORBIDDEN_INTEGRATION_MARKERS = ("GMAIL", "GOOGLE_CALENDAR", "CONTACTS", "CANVAS", "VHL", "SCHOOL_ACCOUNT", "SLACK", "NOTION", "WHATSAPP", "TELEGRAM", "IMAP")
 
 def validate_architecture():
-    configured = [key for key, value in os.environ.items() if value and any(marker in key.upper() for marker in FORBIDDEN_INTEGRATION_MARKERS)]
+    configured = [k for k, v in os.environ.items() if v and any(m in k.upper() for m in FORBIDDEN_INTEGRATION_MARKERS)]
     if configured:
-        raise SystemExit("Unsupported integration configured: " + ", ".join(sorted(configured)) + ". Hermes may connect only to GitHub/workspace, OpenAI, Telegram, and its Instinct-only email bridge.")
+        raise SystemExit("Unsupported integration configured: " + ", ".join(sorted(configured))
+            + ". Hermes may connect only to OpenAI and its one-way SMTP report mailbox. It has no inbox, no chat apps, and no account access.")
 
 class Store:
     def __init__(self):
         self.db = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
-        CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, directive TEXT, request TEXT, status TEXT, created REAL, updated REAL, instinct_message_id TEXT, result TEXT);
-        CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, task_id TEXT, kind TEXT, detail TEXT);
-        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, month TEXT,
+            model TEXT, prompt_tokens INTEGER, completion_tokens INTEGER, cost_usd REAL, status TEXT, detail TEXT);
+        CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, kind TEXT, detail TEXT);
         """); self.db.commit()
-    def event(self, kind, detail, task_id=None):
-        self.db.execute("INSERT INTO events(ts,task_id,kind,detail) VALUES(?,?,?,?)", (time.time(),task_id,kind,detail[:10000])); self.db.commit()
-    def task(self, directive, request):
-        tid=uuid.uuid4().hex[:12]; now=time.time(); self.db.execute("INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?)",(tid,directive,request,"queued",now,now,None,None)); self.db.commit(); self.event("task_created",request,tid); return tid
-    def update(self, tid, status, result=None):
-        self.db.execute("UPDATE tasks SET status=?, updated=?, result=COALESCE(?,result) WHERE id=?",(status,time.time(),result,tid)); self.db.commit(); self.event("status",status,tid)
-    def get(self, tid): return self.db.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
-    def pending(self): return self.db.execute("SELECT * FROM tasks WHERE status IN ('sent_to_instinct','fallback_ready') ORDER BY created").fetchall()
-    def recent(self): return self.db.execute("SELECT * FROM tasks ORDER BY created DESC LIMIT 8").fetchall()
-store=Store()
+    def event(self, kind, detail=""):
+        self.db.execute("INSERT INTO events(ts,kind,detail) VALUES(?,?,?)", (time.time(), kind, detail[:10000])); self.db.commit()
+    def run(self, model, pt, ct, cost, status, detail=""):
+        self.db.execute("INSERT INTO runs(ts,month,model,prompt_tokens,completion_tokens,cost_usd,status,detail) VALUES(?,?,?,?,?,?,?,?)",
+            (time.time(), datetime.now().strftime("%Y-%m"), model, pt, ct, cost, status, detail[:10000])); self.db.commit()
+    def month_spend(self):
+        row = self.db.execute("SELECT COALESCE(SUM(cost_usd),0) AS s FROM runs WHERE month=?", (datetime.now().strftime("%Y-%m"),)).fetchone()
+        return float(row["s"])
+store = Store()
 
-def load_directives():
-    with open(os.getenv("HERMES_DIRECTIVES", "/app/directives.yaml"), encoding="utf-8") as f: return yaml.safe_load(f)
+def load_config():
+    with open(os.getenv("HERMES_DIRECTIVES", str(APP / "directives.yaml")), encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
-def directive(item_id):
-    for x in load_directives().get("items",[]):
-        if x.get("id")==item_id and x.get("enabled",False): return x
-    return None
+def read_memory_files(cfg):
+    texts = {}
+    for name in cfg.get("memory_files", ["me.md", "projects.md", "decisions.md", "proposals.md"]):
+        p = APP / name
+        texts[name] = p.read_text(encoding="utf-8") if p.exists() else "(missing)"
+    return texts
 
-def owned_path(rel: str) -> Path:
-    p=(WORKSPACE/rel).resolve()
-    if p != WORKSPACE and WORKSPACE not in p.parents: raise ValueError("path escapes workspace")
-    return p
+def read_inbox(cfg):
+    inbox = APP / cfg.get("inbox_dir", "inbox")
+    summaries, blocked = [], []
+    if inbox.is_dir():
+        for p in sorted(inbox.glob("*.md")):
+            if p.name.lower() == "readme.md": continue
+            text = p.read_text(encoding="utf-8")
+            decision = inspect(text)
+            if decision.allowed:
+                summaries.append((p.name, text))
+            else:
+                blocked.append((p.name, decision.reason))
+                store.event("inbox_blocked", f"{p.name}: {decision.reason}")
+    return summaries, blocked
+
+def parse_projects(projects_md, stall_days):
+    """Deterministic stall signal from projects.md sections with 'Last moved:' dates."""
+    projects, current = [], None
+    for line in projects_md.splitlines():
+        m = re.match(r"^##\s+(.+?)\s*$", line)
+        if m:
+            current = {"name": m.group(1), "last_moved": None, "next": ""}
+            projects.append(current); continue
+        if current is None: continue
+        d = re.search(r"last moved:\s*(\d{4}-\d{2}-\d{2})", line, re.I)
+        if d: current["last_moved"] = d.group(1)
+        n = re.search(r"next:\s*(.+)", line, re.I)
+        if n and not current["next"]: current["next"] = n.group(1).strip()
+    today = datetime.now().date()
+    for p in projects:
+        if p["last_moved"]:
+            p["days"] = (today - datetime.strptime(p["last_moved"], "%Y-%m-%d").date()).days
+        else:
+            p["days"] = None
+        p["stalled"] = p["days"] is not None and p["days"] >= stall_days
+    return projects
+
+def token_price(model):
+    if model in PRICES: return PRICES[model]
+    i = float(os.getenv("HERMES_PRICE_INPUT_PER_1M", "0")); o = float(os.getenv("HERMES_PRICE_OUTPUT_PER_1M", "0"))
+    return (i, o)
+
+def model_pass(cfg, memory, summaries, projects):
+    from openai import OpenAI
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    inbox_text = "\n\n".join(f"--- {name} ---\n{text}" for name, text in summaries) or "(no new Instinct summaries)"
+    stall_lines = "\n".join(
+        f"- {p['name']}: {p['days']} days since movement. Next on file: {p['next'] or 'none recorded'}"
+        for p in projects) or "(no projects parsed)"
+    system = ("You are Hermes, the quiet background reader for Royce Myers. You are not Royce and cannot act for him. "
+        "Read the memory files and Instinct's task summaries, then write a short morning stall report. "
+        "For each tracked project: whether it moved, how many days since it moved, why it matters, and the single obvious next step. "
+        "Flag the 1-3 most stalled projects as suggested focus. Never propose spending money, messaging anyone as Royce, or doing graded schoolwork. "
+        "Be terse; plain text; under 250 words.")
+    user = (f"STALL SIGNAL (computed, trust these numbers):\n{stall_lines}\n\n"
+        f"me.md:\n{memory.get('me.md','')}\n\nprojects.md:\n{memory.get('projects.md','')}\n\n"
+        f"decisions.md:\n{memory.get('decisions.md','')}\n\nproposals.md:\n{memory.get('proposals.md','')}\n\n"
+        f"INSTINCT TASK SUMMARIES:\n{inbox_text}")
+    res = client.chat.completions.create(model=MODEL, max_tokens=MAX_TOKENS,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+    usage = res.usage
+    pin, pout = token_price(MODEL)
+    cost = (usage.prompt_tokens * pin + usage.completion_tokens * pout) / 1_000_000
+    return res.choices[0].message.content, usage.prompt_tokens, usage.completion_tokens, cost
+
+def deterministic_report(projects, blocked):
+    lines = ["STALL SIGNAL (no model pass):"]
+    for p in projects:
+        flag = "STALLED" if p["stalled"] else "ok"
+        days = "unknown" if p["days"] is None else str(p["days"])
+        lines.append(f"- {p['name']}: {days} days since movement [{flag}]. Next on file: {p['next'] or 'none recorded'}")
+    for name, reason in blocked:
+        lines.append(f"- inbox/{name} was blocked by safety rules: {reason}")
+    return "\n".join(lines)
 
 class MailBridge:
-    def send(self, subject, body, task_id=None):
-        sender=os.environ["HERMES_EMAIL_ADDRESS"]
-        msg=EmailMessage(); msg["From"]=sender; msg["To"]=INSTINCT; msg["Subject"]=subject
-        msg.set_content("Hermes here - Royce Myers' backup agent. I am not Royce and cannot authorize actions in his name.\n\n"+body)
-        with smtplib.SMTP_SSL(os.environ["SMTP_HOST"],int(os.getenv("SMTP_PORT","465")),context=ssl.create_default_context()) as s:
-            s.login(os.environ["SMTP_USERNAME"],os.environ["SMTP_PASSWORD"]); s.send_message(msg)
-        store.event("email_sent",f"to={INSTINCT}; subject={subject}",task_id)
-    def replies(self):
-        out=[]
-        with imaplib.IMAP4_SSL(os.environ["IMAP_HOST"],int(os.getenv("IMAP_PORT","993"))) as im:
-            im.login(os.environ["IMAP_USERNAME"],os.environ["IMAP_PASSWORD"]); im.select("INBOX")
-            _,data=im.search(None,'UNSEEN',f'FROM "{INSTINCT}"')
-            for num in data[0].split():
-                _,raw=im.fetch(num,"(RFC822)"); msg=email.message_from_bytes(raw[0][1])
-                text=""
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type()=="text/plain" and not part.get_filename(): text=part.get_payload(decode=True).decode(errors="replace"); break
-                else: text=msg.get_payload(decode=True).decode(errors="replace")
-                out.append((msg.get("Subject",""),text,msg.get("Message-ID",""))); im.store(num,"+FLAGS","\\Seen")
-        return out
-mail=MailBridge()
+    def send(self, subject, body):
+        msg = EmailMessage()
+        msg["From"] = os.environ["HERMES_EMAIL_ADDRESS"]; msg["To"] = INSTINCT; msg["Subject"] = subject
+        msg.set_content("Hermes here - Royce Myers' background reader. I am not Royce and cannot authorize actions in his name.\n\n" + body)
+        with smtplib.SMTP_SSL(os.environ["SMTP_HOST"], int(os.getenv("SMTP_PORT", "465")), context=ssl.create_default_context()) as s:
+            s.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"]); s.send_message(msg)
+        store.event("email_sent", f"to={INSTINCT}; subject={subject}")
+mail = MailBridge()
 
-def allowed_user(update): return bool(update.effective_user and OWNER_ID and update.effective_user.id==OWNER_ID)
-async def deny(update): await update.effective_message.reply_text("Hermes is private.")
-async def ping_owner(app, text):
-    if OWNER_ID: await app.bot.send_message(chat_id=OWNER_ID,text=text[:4000])
+def run_once(dry_run=False):
+    cfg = load_config()
+    stall_days = int(cfg.get("stall_days", 3))
+    memory = read_memory_files(cfg)
+    summaries, blocked = read_inbox(cfg)
+    projects = parse_projects(memory.get("projects.md", ""), stall_days)
+    spend = store.month_spend()
+    log.info("month spend so far: $%.4f (cap $%.2f)", spend, MONTHLY_BUDGET_USD)
 
-async def ask_instinct(tid):
-    row=store.get(tid)
-    body=f"Outcome requested: {row['request']}\nDirective: {row['directive']}\n\nPlease take this work if it fits your tools. Reply with what you did, what Royce must decide, or explicitly say you cannot do it. Correlation ID: {tid}."
-    await asyncio.to_thread(mail.send,f"[Hermes:{tid}] Work request",body,tid); store.update(tid,"sent_to_instinct")
+    if spend >= MONTHLY_BUDGET_USD:
+        notice = (f"Hermes monthly budget cap hit: ${spend:.4f} of ${MONTHLY_BUDGET_USD:.2f} spent. "
+                  "No model pass made. Raise HERMES_MONTHLY_BUDGET_USD or wait for next month.\n\n" + deterministic_report(projects, blocked))
+        store.run(MODEL, 0, 0, 0.0, "budget_cap")
+        if dry_run: print(notice); return
+        mail.send("[Hermes] Budget cap reached - report without model pass", notice); return
 
-SYSTEM="""You are Hermes, Royce Myers' backup builder. You are always Hermes, never Royce. Be terse. Never complete or submit graded coursework; never spend money or credits; never message third parties as Royce; never change account settings. Work only inside the given workspace. Return JSON with keys summary and files, where files is a list of {path,content}. Produce useful local drafts or code; do not claim deployment, sending, or execution you did not perform."""
-async def local_work(tid):
-    row=store.get(tid); item=directive(row["directive"])
-    if not item: store.update(tid,"blocked","Directive missing or disabled"); return "Blocked: directive missing or disabled."
-    decision=inspect(row["request"])
-    if not decision.allowed: store.update(tid,"escalated",decision.reason); return decision.reason
-    if MODE != "active": store.update(tid,"blocked","Runtime is read-only. Set HERMES_MODE=active after reviewing directives."); return "Read-only mode: no files changed."
-    autonomy=item.get("autonomy","ask-first")
-    if autonomy=="ask-first": store.update(tid,"needs_approval","Directive requires Royce approval."); return "This directive is ask-first. Reply /approve "+tid
-    client=AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    prompt=json.dumps({"directive":item,"request":row["request"],"autonomy":autonomy})
-    res=await client.chat.completions.create(model=os.getenv("HERMES_MODEL","gpt-4.1-mini"),response_format={"type":"json_object"},messages=[{"role":"system","content":SYSTEM},{"role":"user","content":prompt}])
-    data=json.loads(res.choices[0].message.content); written=[]
-    base=item.get("local_path",item["id"])
-    for f in data.get("files",[]):
-        p=owned_path(str(Path(base)/f["path"])); p.parent.mkdir(parents=True,exist_ok=True); p.write_text(f["content"],encoding="utf-8"); written.append(str(p.relative_to(WORKSPACE)))
-    result=data.get("summary","Draft complete")+("\nFiles: "+", ".join(written) if written else "")
-    store.update(tid,"drafted" if autonomy=="draft-only" else "completed",result); return result
-
-async def cmd_start(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    if not allowed_user(update): return await deny(update)
-    await update.message.reply_text(f"Hermes online. Mode: {MODE}. Commands: /task <directive-id> <work>, /status, /testloop, /approve <id>.")
-async def cmd_status(update,context):
-    if not allowed_user(update): return await deny(update)
-    rows=store.recent(); text=f"Mode: {MODE}\n"+"\n".join(f"{r['id']} {r['status']} - {r['request'][:80]}" for r in rows)
-    await update.message.reply_text(text or "No tasks yet.")
-async def cmd_testloop(update,context):
-    if not allowed_user(update): return await deny(update)
-    try: await asyncio.to_thread(mail.send,"[Hermes] Loop test","Hermes is online. Please reply so I can confirm the Instinct bridge is live."); await update.message.reply_text("Test email sent to Instinct as Hermes.")
-    except Exception as e: log.exception("test loop"); await update.message.reply_text("Test failed. Check Hermes mailbox settings.")
-async def cmd_task(update,context):
-    if not allowed_user(update): return await deny(update)
-    if len(context.args)<2: return await update.message.reply_text("Use: /task <directive-id> <what to do>")
-    did=context.args[0]; req=" ".join(context.args[1:]); item=directive(did)
-    if not item: return await update.message.reply_text("That directive is missing or disabled.")
-    d=inspect(req)
-    if not d.allowed:
-        store.event("boundary_block",d.reason); await update.message.reply_text(d.reason+" I can ask Instinct to coach or prepare safe support instead."); return
-    tid=store.task(did,req)
-    try: await ask_instinct(tid); await update.message.reply_text(f"Sent to Instinct as Hermes. Tracking {tid}; local fallback in {FALLBACK_SECONDS//60} minutes if needed.")
-    except Exception: log.exception("bridge"); store.update(tid,"fallback_ready","Instinct bridge failed"); await update.message.reply_text(f"Instinct bridge failed. Tracking {tid} for local fallback.")
-async def cmd_approve(update,context):
-    if not allowed_user(update): return await deny(update)
-    if not context.args: return await update.message.reply_text("Use: /approve <task-id>")
-    tid=context.args[0]; row=store.get(tid)
-    if not row: return await update.message.reply_text("Unknown task.")
-    item=directive(row["directive"])
-    if not item: return await update.message.reply_text("Directive unavailable.")
-    # Approval only allows safe local drafting/building; hard boundaries still run.
-    original=item.get("autonomy"); item["autonomy"]="draft-only"
-    decision=inspect(row["request"])
-    if not decision.allowed: return await update.message.reply_text(decision.reason)
-    store.update(tid,"fallback_ready"); await update.message.reply_text(await local_work(tid))
-async def plain(update,context):
-    if not allowed_user(update): return await deny(update)
-    await update.message.reply_text("Use /task <directive-id> <work>. Hermes asks Instinct first and tracks the handoff.")
-
-async def monitor(app):
-    while True:
+    if os.getenv("OPENAI_API_KEY"):
         try:
-            for subject,body,msgid in await asyncio.to_thread(mail.replies):
-                import re
-                m=re.search(r"\[Hermes:([a-f0-9]{12})\]",subject,re.I)
-                if not m: store.event("unmatched_reply",subject); continue
-                tid=m.group(1).lower(); row=store.get(tid)
-                if not row: continue
-                store.event("instinct_reply",body,tid)
-                low=body.lower()
-                if any(x in low for x in ("cannot do","can't do","unable to","cannot help")):
-                    store.update(tid,"fallback_ready",body); result=await local_work(tid); await ping_owner(app,f"Instinct could not take {tid}. Hermes fallback: {result}")
-                else:
-                    store.update(tid,"completed_by_instinct",body); await ping_owner(app,f"Instinct replied on {tid}:\n{body[:3200]}")
-            now=time.time()
-            for row in store.pending():
-                if row["status"]=="sent_to_instinct" and now-row["updated"]>=FALLBACK_SECONDS:
-                    store.update(row["id"],"fallback_ready","Instinct fallback timer expired"); result=await local_work(row["id"]); await ping_owner(app,f"No Instinct reply before fallback for {row['id']}. Hermes: {result}")
-        except Exception: log.exception("monitor loop")
-        await asyncio.sleep(30)
+            report, pt, ct, cost = model_pass(cfg, memory, summaries, projects)
+        except Exception as e:
+            log.exception("model pass failed")
+            report, pt, ct, cost = deterministic_report(projects, blocked) + f"\n\n(model pass failed: {e})", 0, 0, 0.0
+            store.run(MODEL, pt, ct, cost, "model_error", str(e))
+        else:
+            store.run(MODEL, pt, ct, cost, "ok")
+    else:
+        report, pt, ct, cost = deterministic_report(projects, blocked), 0, 0, 0.0
+        store.run(MODEL, 0, 0, 0.0, "no_api_key", "deterministic report only")
 
-async def post_init(app): app.create_task(monitor(app))
+    if blocked:
+        report += "\n\nBlocked by safety rules: " + "; ".join(f"inbox/{n} ({r})" for n, r in blocked)
+    report += f"\n\n-- run cost: ${cost:.4f} ({pt}+{ct} tokens, {MODEL}); month total: ${store.month_spend():.4f} of ${MONTHLY_BUDGET_USD:.2f}"
+
+    if dry_run:
+        print(report); return
+    mail.send(f"[Hermes] Nightly stall report - {datetime.now():%Y-%m-%d}", report)
+    log.info("report emailed to %s", INSTINCT)
+
+def next_run_dt(cfg):
+    tz = ZoneInfo(cfg.get("timezone", "America/New_York"))
+    hh, mm = (int(x) for x in str(cfg.get("run_time", "01:00")).split(":")[:2])
+    now = datetime.now(tz)
+    nxt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if nxt <= now: nxt += timedelta(days=1)
+    return nxt
+
 def main():
+    ap = argparse.ArgumentParser(description="Hermes quiet background reader")
+    ap.add_argument("--once", action="store_true", help="run one pass and exit (cron-friendly)")
+    ap.add_argument("--dry-run", action="store_true", help="run one pass and print the report instead of emailing it")
+    args = ap.parse_args()
     validate_architecture()
-    required=["TELEGRAM_BOT_TOKEN","TELEGRAM_ALLOWED_USER_ID","HERMES_EMAIL_ADDRESS","SMTP_HOST","SMTP_USERNAME","SMTP_PASSWORD","IMAP_HOST","IMAP_USERNAME","IMAP_PASSWORD"]
-    missing=[x for x in required if not os.getenv(x)]
-    if missing: raise SystemExit("Missing environment variables: "+", ".join(missing))
-    app=Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).post_init(post_init).build()
-    app.add_handler(CommandHandler("start",cmd_start)); app.add_handler(CommandHandler("status",cmd_status)); app.add_handler(CommandHandler("testloop",cmd_testloop)); app.add_handler(CommandHandler("task",cmd_task)); app.add_handler(CommandHandler("approve",cmd_approve)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,plain)); app.run_polling(drop_pending_updates=True)
-if __name__=="__main__": main()
+    if args.once or args.dry_run:
+        run_once(dry_run=args.dry_run); return
+    for var in ("HERMES_EMAIL_ADDRESS", "SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD", "OPENAI_API_KEY"):
+        if not os.getenv(var): raise SystemExit(f"Missing environment variable: {var}")
+    cfg = load_config()
+    log.info("Hermes reader online. Nightly run at %s %s.", cfg.get("run_time", "01:00"), cfg.get("timezone", "America/New_York"))
+    while True:
+        nxt = next_run_dt(cfg)
+        log.info("next run: %s", nxt.isoformat())
+        while (delay := (nxt - datetime.now(nxt.tzinfo)).total_seconds()) > 0:
+            time.sleep(min(delay, 300))
+        try: run_once()
+        except Exception: log.exception("nightly run failed")
+
+if __name__ == "__main__":
+    main()
