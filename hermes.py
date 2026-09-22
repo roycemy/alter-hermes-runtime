@@ -18,6 +18,12 @@ INSTINCT = os.getenv("HERMES_INSTINCT_ADDRESS", "xt1udv@mail.instinct.com")
 OWNER_ID = int(os.getenv("TELEGRAM_ALLOWED_USER_ID", "0") or 0)
 MODE = os.getenv("HERMES_MODE", "readonly").lower()
 FALLBACK_SECONDS = int(os.getenv("HERMES_FALLBACK_MINUTES", "30")) * 60
+FORBIDDEN_INTEGRATION_MARKERS = ("GMAIL", "GOOGLE_CALENDAR", "CONTACTS", "CANVAS", "VHL", "SCHOOL_ACCOUNT", "SLACK", "NOTION", "WHATSAPP")
+
+def validate_architecture():
+    configured = [key for key, value in os.environ.items() if value and any(marker in key.upper() for marker in FORBIDDEN_INTEGRATION_MARKERS)]
+    if configured:
+        raise SystemExit("Unsupported integration configured: " + ", ".join(sorted(configured)) + ". Hermes may connect only to GitHub/workspace, OpenAI, Telegram, and its Instinct-only email bridge.")
 
 class Store:
     def __init__(self):
@@ -167,6 +173,7 @@ async def monitor(app):
 
 async def post_init(app): app.create_task(monitor(app))
 def main():
+    validate_architecture()
     required=["TELEGRAM_BOT_TOKEN","TELEGRAM_ALLOWED_USER_ID","HERMES_EMAIL_ADDRESS","SMTP_HOST","SMTP_USERNAME","SMTP_PASSWORD","IMAP_HOST","IMAP_USERNAME","IMAP_PASSWORD"]
     missing=[x for x in required if not os.getenv(x)]
     if missing: raise SystemExit("Missing environment variables: "+", ".join(missing))
