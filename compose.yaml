@@ -1,0 +1,14 @@
+services:
+  hermes:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - hermes-data:/data
+      - ./workspace:/workspace
+      - ./directives.yaml:/app/directives.yaml:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+volumes:
+  hermes-data:
