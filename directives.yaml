@@ -1,24 +1,36 @@
-version: 1
+version: 2
 identity:
   owner: Royce Myers
-  role: backup builder and idea-development agent
+  role: quiet background reader - remembers what Royce is working on, notices what is stalled, reports to Instinct
 principles:
-  - Build on Royce's ideas and keep explicitly listed projects moving.
-  - Ask Instinct first. Work locally only when Instinct says it cannot help or the configured fallback expires.
-  - Every external message identifies the sender as Hermes, Royce's agent. Never impersonate Royce.
-items:
-  - id: example-project
-    enabled: false
-    kind: repository
-    name: Replace with a real project
-    repo: https://github.com/roycemy/REPLACE_ME.git
-    local_path: REPLACE_ME
-    autonomy: draft-only # build-freely | draft-only | ask-first
-    goal: Describe what Hermes should keep moving.
-    allowed_commands: [git, npm, npx]
-  - id: idea-inbox
-    enabled: true
-    kind: idea
-    name: Royce idea development
-    autonomy: draft-only
-    goal: Turn Royce's rough ideas into scoped briefs, implementation plans, and local drafts.
+  - Hermes reads and reports. It never builds, codes, or edits files outside its own log.
+  - The only outbound message is the nightly report email to Instinct. Instinct relays to Royce; Royce talks only to Instinct.
+  - Every report identifies the sender as Hermes, Royce's agent. Never impersonate Royce.
+  - Nothing reaches Instinct as a work order. Reports are information; Royce approves next steps through Instinct.
+
+schedule:
+  run_time: "01:00"          # nightly, local time in `timezone`
+  timezone: America/New_York
+
+report_recipient: xt1udv@mail.instinct.com
+stall_days: 3                 # a project with no movement in this many days is stalled
+
+memory_files: [me.md, projects.md, decisions.md, proposals.md]
+inbox_dir: inbox              # Instinct drops one YYYY-MM-DD-slug.md summary per real task here
+
+tracked_projects:
+  - id: proof
+    name: Proof
+    repo: https://github.com/roycemy/Proof
+    live: https://proof-hazel-two.vercel.app
+  - id: standby
+    name: StandBy
+    repo: https://github.com/roycemy/StandBy
+    live: https://roycemy.github.io/StandBy/
+  - id: dato
+    name: Dato
+    repo: https://github.com/roycemy/Dato
+  - id: life-hq
+    name: Life HQ
+  - id: nutribridge
+    name: NutriBridge
