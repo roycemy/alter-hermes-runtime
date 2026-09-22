@@ -1,0 +1,10 @@
+.env
+*.private.yaml
+secrets/
+credentials/
+whatsapp-session/
+__pycache__/
+*.py[cod]
+.venv/
+workspace/
+*.db
