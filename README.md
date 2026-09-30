@@ -104,3 +104,26 @@ This repo previously held an always-on Telegram-controlled builder agent. That
 design was shelved: Instinct does all the building, so Hermes became this
 reader. The Telegram bot, builder loop, IMAP reply polling, and workspace
 writes were removed.
+
+## Activation status and maintenance (September 30)
+
+Delivery now defaults OFF (`HERMES_DELIVERY_ENABLED=false`): the nightly
+reader writes `/data/latest-report.txt` locally. Enable email only after the
+sender, recipient and report scope are approved. No missing model key is
+required for deterministic reports. Unchanged state skips the report and model
+call. A newly crossed three-day stall threshold counts as a change.
+
+The schedule is read from the nested `schedule` section. Stall dates use Eastern
+time. The monthly model cap is hard-limited to $1; each call reserves conservative
+worst-case cost first, unknown pricing fails closed, retries are disabled, and
+uncertain provider outcomes keep their reservation. This is based on the configured
+price table, not a provider billing integration. Review current provider pricing
+before enabling paid calls. Model/API delivery has not been end-to-end verified.
+
+Repo commits do not automatically update a VPS checkout. Before each nightly run,
+the trusted maintainer must update the deployed board/inbox via a reviewed fast-forward
+pull or private file copy. Do not give Hermes GitHub credentials or write access.
+No automatic cross-assistant bridge or mailbox is provisioned by these files.
+
+Tests: `pytest -q`. No-send test: `python hermes.py --dry-run` (may use a model
+if a key is configured; unset the key for a zero-cost deterministic run).
