@@ -190,22 +190,25 @@ def _run_once(dry_run=False):
     memory = read_memory_files(cfg)
     summaries, blocked = read_inbox(cfg)
     projects = parse_projects(memory.get("projects.md", ""), stall_days)
+    # Ages change with the date even when the board files do not. Recompute
+    # this zero-cost signal before deciding whether a model pass is needed.
+    signal = deterministic_report(projects, blocked)
     fingerprint = hashlib.sha256(json.dumps({
         "memory": memory, "summaries": summaries, "blocked": blocked,
-        "stalled": [(p["name"], p["stalled"]) for p in projects],
+        "report": signal,
         "delivery_enabled": os.getenv("HERMES_DELIVERY_ENABLED", "false"),
         "model": MODEL, "has_key": bool(os.getenv("OPENAI_API_KEY")),
     }, sort_keys=True).encode()).hexdigest()
     if not dry_run and (DATA / "last-delivered-fingerprint").exists():
         if (DATA / "last-delivered-fingerprint").read_text() == fingerprint:
-            store.event("unchanged", "No meaningful change; skipped report and model call")
+            store.event("unchanged", "Recomputed report unchanged; skipped model call and delivery")
             return
     spend = store.month_spend()
     log.info("month spend so far: $%.4f (cap $%.2f)", spend, MONTHLY_BUDGET_USD)
 
     if spend >= MONTHLY_BUDGET_USD:
         notice = (f"Hermes monthly budget cap hit: ${spend:.4f} of ${MONTHLY_BUDGET_USD:.2f} spent. "
-                  "No model pass made. The hard cap stays at $1; model calls resume next month.\n\n" + deterministic_report(projects, blocked))
+                  "No model pass made. The hard cap stays at $1; model calls resume next month.\n\n" + signal)
         store.run(MODEL, 0, 0, 0.0, "budget_cap")
         if dry_run: print(notice); return
         deliver_report("[Hermes] Budget cap reached - report without model pass", notice, fingerprint); return
@@ -215,12 +218,12 @@ def _run_once(dry_run=False):
             report, pt, ct, cost = model_pass(cfg, memory, summaries, projects)
         except Exception as e:
             log.exception("model pass failed")
-            report, pt, ct, cost = deterministic_report(projects, blocked) + f"\n\n(model pass failed: {e})", 0, 0, 0.0
+            report, pt, ct, cost = signal + f"\n\n(model pass failed: {e})", 0, 0, 0.0
             store.run(MODEL, pt, ct, cost, "model_error", str(e))
         else:
             pass  # model_pass reconciles its reserved row atomically
     else:
-        report, pt, ct, cost = deterministic_report(projects, blocked), 0, 0, 0.0
+        report, pt, ct, cost = signal, 0, 0, 0.0
         store.run(MODEL, 0, 0, 0.0, "no_api_key", "deterministic report only")
 
     if blocked:
