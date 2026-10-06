@@ -3,10 +3,17 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    read_only: true
+    tmpfs:
+      - /tmp
     volumes:
       - hermes-data:/data
-      - ./workspace:/workspace
       - ./directives.yaml:/app/directives.yaml:ro
+      - ./me.md:/app/me.md:ro
+      - ./projects.md:/app/projects.md:ro
+      - ./decisions.md:/app/decisions.md:ro
+      - ./proposals.md:/app/proposals.md:ro
+      - ./inbox:/app/inbox:ro
     security_opt:
       - no-new-privileges:true
     cap_drop: [ALL]
